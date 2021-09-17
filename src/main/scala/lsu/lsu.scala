@@ -214,7 +214,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   val ldq_head         = Reg(UInt(ldqAddrSz.W))
   val ldq_tail         = Reg(UInt(ldqAddrSz.W))
+  //head 用来commmit到访存子系统里去
   val stq_head         = Reg(UInt(stqAddrSz.W)) // point to next store to clear from STQ (i.e., send to memory)
+  //tail是用来接受输入的
   val stq_tail         = Reg(UInt(stqAddrSz.W))
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
@@ -231,6 +233,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // s1 : do TLB, if success and not killed, fire request go to h_s2
   //      store s1_data to register
   //      if tlb miss, go to s2_nack
+  //      什么叫don't get TLB，可能是tlb的端口不够
   //      if don't get TLB, go to s2_nack
   //      store tlb xcpt
   // s2 : If kill, go to dead
@@ -255,6 +258,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.perf.release := io.dmem.perf.release
 
 
+// clear_store 指的是当前周期有没有store指令写到下一级
+
   val clear_store     = WireInit(false.B)
   val live_store_mask = RegInit(0.U(numStqEntries.W))
   var next_live_store_mask = Mux(clear_store, live_store_mask & ~(1.U << stq_head),
@@ -271,6 +276,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   //-------------------------------------------------------------
 
   // This is a newer store than existing loads, so clear the bit in all the store dependency masks
+  // 当当前周期有在sq中顺序提交的entry，把对应的在lq中的表示在当前load前面的store的mask去掉
   for (i <- 0 until numLdqEntries)
   {
     when (clear_store)
@@ -288,6 +294,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   var ldq_full = Bool()
   var stq_full = Bool()
 
+  // 从decode阶段将load和store入队，每次最多入队corewidth多个load和store
   for (w <- 0 until coreWidth)
   {
     ldq_full = WrapInc(ld_enq_idx, numLdqEntries) === ldq_head
@@ -399,6 +406,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val p2_block_load_mask = RegNext(p1_block_load_mask)
 
  // Prioritize emptying the store queue when it is almost full
+ // store queue还有1到两个空就满了
   val stq_almost_full = RegNext(WrapInc(WrapInc(st_enq_idx, numStqEntries), numStqEntries) === stq_head ||
                                 WrapInc(st_enq_idx, numStqEntries) === stq_head)
 
