@@ -375,6 +375,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // First we determine what operations are waiting to execute.
   // These are the "can_fire"/"will_fire" signals
 
+  // will指的是有请求
+  // can指的是会发生这个请求
   val will_fire_load_incoming  = Wire(Vec(memWidth, Bool()))
   val will_fire_stad_incoming  = Wire(Vec(memWidth, Bool()))
   val will_fire_sta_incoming   = Wire(Vec(memWidth, Bool()))
@@ -388,6 +390,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val will_fire_store_commit   = Wire(Vec(memWidth, Bool()))
   val will_fire_load_wakeup    = Wire(Vec(memWidth, Bool()))
 
+  // 这个应该是发射队列送过来的ls访存流水线上的请求
   val exe_req = WireInit(VecInit(io.core.exe.map(_.req)))
   // Sfence goes through all pipes
   for (i <- 0 until memWidth) {
@@ -414,12 +417,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Delay firing load wakeups and retries now
   val store_needs_order = WireInit(false.B)
 
+  // loadstore流水线上送过来的请求在decode阶段是写到lq和sq的哪个位置
   val ldq_incoming_idx = widthMap(i => exe_req(i).bits.uop.ldq_idx)
+  // e为具体的index的数据
   val ldq_incoming_e   = widthMap(i => ldq(ldq_incoming_idx(i)))
 
   val stq_incoming_idx = widthMap(i => exe_req(i).bits.uop.stq_idx)
   val stq_incoming_e   = widthMap(i => stq(stq_incoming_idx(i)))
 
+  // agepriorityencoder可以选出从第二个参数开始的第一个参数第一个的那个index
   val ldq_retry_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i => {
     val e = ldq(i).bits
     val block = block_load_mask(i) || p1_block_load_mask(i)
@@ -446,29 +452,37 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Determine what can fire
 
   // Can we fire a incoming load
+  // 流水线来了load
   val can_fire_load_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_load)
 
   // Can we fire an incoming store addrgen + store datagen
+  // 流水线来了store，并且这个store是带address和data的？
   val can_fire_stad_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
                                                               && exe_req(w).bits.uop.ctrl.is_std)
 
   // Can we fire an incoming store addrgen
+  // 流水线来了store，并且这个store是带address但不带data的？
   val can_fire_sta_incoming  = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
                                                               && !exe_req(w).bits.uop.ctrl.is_std)
 
   // Can we fire an incoming store datagen
+  // 流水线来了store，并且这个store是带data不带address的？
   val can_fire_std_incoming  = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_std
                                                               && !exe_req(w).bits.uop.ctrl.is_sta)
 
   // Can we fire an incoming sfence
+  // 流水线来的是sfence
   val can_fire_sfence        = widthMap(w => exe_req(w).valid && exe_req(w).bits.sfence.valid)
 
   // Can we fire a request from dcache to release a line
   // This needs to go through LDQ search to mark loads as dangerous
+  // dcache为什么要发release给LSU啊？，这里指最后一条通道是否收到的dcache的release请求
   val can_fire_release       = widthMap(w => (w == memWidth-1).B && io.dmem.release.valid)
   io.dmem.release.ready     := will_fire_release.reduce(_||_)
 
   // Can we retry a load that missed in the TLB
+  // 这个被选为重发的load可以不可以重发
+  // 重发的load只在最后一个流水线里面发？
   val can_fire_load_retry    = widthMap(w =>
                                ( ldq_retry_e.valid                            &&
                                  ldq_retry_e.bits.addr.valid                  &&
