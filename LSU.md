@@ -53,6 +53,22 @@ store后面的load无法检查相关性，导致降低并发度，但是IQ将其
     + 如果有store的地址过来，就把它的虚拟地址写到sq中，设置为valid
     + 如果有store的数据过来，就把它的数据写到sq中，设置为valid
 + 因为从IQ中把东西发过来(地址，数据)，记录到了lq和sq中其实就ok了，它有没有去后面的访存流水级其实不重要，因为lq和sq中有它，可以从中发
-+ 每一条流水级往后面发什么是有优先级的，如果这个
+
+
+### load store的检查
+
+load只检查有没有新的load插到他前面去了
+thread1:                      thread2:
+load1  a                         
+...                           store1  a
+load2  a
+load2提前于load1执行了，实际顺序应该是store1->load1->load2，预期是两个load都得到新的值，如果load2提前执行了，load1还没有执行，导致load2读到了旧值，但是load1读到新值，不满足程序序。这种情况有一个特点就是load2读完之后如果store写了，就会导致第一个核release掉这个block，把load2标志为observed，load1检查时去检查比他新的load，发现load2 observed并且地址相同，就发生了load-to-load违例，如果load1去检查的时候发现load2没有observed，就说明现在store还没有写，于是load1，load2都读到旧值，这种历史是可以的。
+
+如果load2出来之后发现有一个比他老的load1，并且load1已经有了物理地址，两个load的地址相同，那这个load1要么是还没有执行完，比如sleep了，要么是dcache miss了，数据还没上来。如果load2发现了这种情况，就不管有没有store，先把自己kill掉，不要让自己超过load1，把他发出去的访问cache的请求也kill掉.
+
+store需要检查是否有新的load插到他前面去了，并且这些load没有用这个store的数据，有两种情况：一个是这个load没有用forward的数据，一个是它用了，但是不是这个store的数据，是一个老的store的数据。
+lq中的order_fail把这个load标记为fail的load(最终怎么去处理这个fail？应该是作为一个异常去处理，因为这个load可能已经commit到ROB了，后面的一些指令已经使用了这个load的结果)。
+
+load还需要搜索能否使用前面的store去forward，如果可以，且store的数据已经就绪了，就可以forward，不使用dcache的数据。如果store的数据没有就绪，就让这个load去sleep，过一段时间再发出来。如果这个load没有检测出来store相关，也可能是store还没有得到最终的物理地址。所以store的地址要尽早发出来，可以减少被kill掉的load，数据也要尽快搞到，不然load就要去sleep
 
 

@@ -1158,6 +1158,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
+// load去sq里面找，在这个load之前的store，有没有能够forward的
   for (i <- 0 until numStqEntries) {
     val s_addr = stq(i).bits.addr.bits
     val s_uop  = stq(i).bits.uop
@@ -1192,6 +1193,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
 
   // Set execute bit in LDQ
+  // executed这个信号是用来干什么的
   for (i <- 0 until numLdqEntries) {
     when (s1_set_execute(i)) { ldq(i).bits.executed := true.B }
   }
@@ -1276,6 +1278,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.lxcpt.bits  := r_xcpt
 
   // Task 4: Speculatively wakeup loads 1 cycle before they come back
+  // load被发到了流水线，TLB不一定命中，cache也不一定命中，推测唤醒一下IQ里面的相关性指令
   for (w <- 0 until memWidth) {
     io.core.spec_ld_wakeup(w).valid := enableFastLoadUse.B          &&
                                        fired_load_incoming(w)       &&
