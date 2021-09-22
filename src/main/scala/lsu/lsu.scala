@@ -1367,6 +1367,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
     when (dmem_resp_fired(w) && wb_forward_valid(w))
     {
+      // 如果能够从sq中forward东西过来，会在上一个周期kill掉访存请求，所以dmem_resp_fired不会为true
       // Twiddle thumbs. Can't forward because dcache response takes precedence
     }
       .elsewhen (!dmem_resp_fired(w) && wb_forward_valid(w))
