@@ -111,8 +111,10 @@ class LSUDMemIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
 
 class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 {
+  // exe 是接受IQ发往LS流水线的请求
   val exe = Vec(memWidth, new LSUExeIO)
 
+  // dis_* 是在dispatch阶段接受入队请求
   val dis_uops    = Flipped(Vec(coreWidth, Valid(new MicroOp)))
   val dis_ldq_idx = Output(Vec(coreWidth, UInt(ldqAddrSz.W)))
   val dis_stq_idx = Output(Vec(coreWidth, UInt(stqAddrSz.W)))
@@ -170,20 +172,31 @@ class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
 class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
     with HasBoomUOP
 {
+  // 注意是valid，带了一个valid信号
   val addr                = Valid(UInt(coreMaxAddrBits.W))
   val addr_is_virtual     = Bool() // Virtual address, we got a TLB miss
   val addr_is_uncacheable = Bool() // Uncacheable, wait until head of ROB to execute
 
+  // 指的是load发送给了dmem？，如果dmem miss了是不是要reset？？
   val executed            = Bool() // load sent to memory, reset by NACKs
   val succeeded           = Bool()
   val order_fail          = Bool()
   val observed            = Bool()
 
+  // 比当前load更老的store在sq中的位置，两部分逻辑与其相关：在入队的时候就计算出来mask，当sq中的store提交后将其clear
   val st_dep_mask         = UInt(numStqEntries.W) // list of stores older than us
+  // 比当前load老，但是是这群老人中最新的那一条
   val youngest_stq_idx    = UInt(stqAddrSz.W) // index of the oldest store younger than us
 
+  // ----- 这是为了判断load-store违例的 -----
+  // 因为load的值从好多地方可以得到：1.从dcache中，2.从前面的store中
+  // 一般load得到load的数据后，它就完成了，但是这个load它有可能是非常超前执行的，导致有可能有与他相关的store还没有算出地址和数据它就执行完了
+  // 也有可能真正与它相关的那条store还没有计算出来，但它用的是更老的与其相关的store的结果
+  // 所以store出来的时候，它要去检查load，发现有load与它相关，在它后面，但是**没用它的数据**或者**用的是更老的与其相关的store的数据**
+  // 此时这个load就是order_fail的，我们要杀了它
   val forward_std_val     = Bool()
   val forward_stq_idx     = UInt(stqAddrSz.W) // Which store did we get the store-load forward from?
+  // ----- 这是为了判断load-store违例的 -----
 
   val debug_wb_data       = UInt(xLen.W)
 }
@@ -210,7 +223,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val ldq = Reg(Vec(numLdqEntries, Valid(new LDQEntry)))
   val stq = Reg(Vec(numStqEntries, Valid(new STQEntry)))
 
-
+  // 从tail接受输入
 
   val ldq_head         = Reg(UInt(ldqAddrSz.W))
   val ldq_tail         = Reg(UInt(ldqAddrSz.W))
@@ -218,6 +231,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_head         = Reg(UInt(stqAddrSz.W)) // point to next store to clear from STQ (i.e., send to memory)
   //tail是用来接受输入的
   val stq_tail         = Reg(UInt(stqAddrSz.W))
+  // store在ROB中commit了之后就可以去execute了，execute应该指的是把它写入到下一级存储中
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
 
@@ -229,6 +243,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           stq_tail === stq_execute_head,
             "stq_execute_head got off track.")
 
+  // 这个h_* 和hella_*不知道是什么东西，可能是它的一个特殊的结构，可以不用去管
   val h_ready :: h_s1 :: h_s2 :: h_s2_nack :: h_wait :: h_replay :: h_dead :: Nil = Enum(7)
   // s1 : do TLB, if success and not killed, fire request go to h_s2
   //      store s1_data to register
@@ -259,6 +274,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
 
 // clear_store 指的是当前周期有没有store指令写到下一级
+// 应该是一个周期最多写一个下去
+// live_store_mask 记录现在sq里面valid的store
 
   val clear_store     = WireInit(false.B)
   val live_store_mask = RegInit(0.U(numStqEntries.W))
@@ -276,7 +293,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   //-------------------------------------------------------------
 
   // This is a newer store than existing loads, so clear the bit in all the store dependency masks
-  // 当当前周期有在sq中顺序提交的entry，把对应的在lq中的表示在当前load前面的store的mask去掉
+  // 当 当前周期有在sq中顺序提交的entry，把对应的在lq中的表示在当前load前面的store的mask去掉
   for (i <- 0 until numLdqEntries)
   {
     when (clear_store)
@@ -291,12 +308,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   val stq_nonempty = (0 until numStqEntries).map{ i => stq(i).valid }.reduce(_||_) =/= 0.U
 
+  // 注意这里的变量是var不是val，上面的*_enq_idx也是
   var ldq_full = Bool()
   var stq_full = Bool()
 
   // 从decode阶段将load和store入队，每次最多入队corewidth多个load和store
   for (w <- 0 until coreWidth)
   {
+    // 反馈给decode阶段，满了没有？ enq是enq到哪个位置了？
     ldq_full = WrapInc(ld_enq_idx, numLdqEntries) === ldq_head
     io.core.ldq_full(w)    := ldq_full
     io.core.dis_ldq_idx(w) := ld_enq_idx
@@ -304,14 +323,19 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     stq_full = WrapInc(st_enq_idx, numStqEntries) === stq_head
     io.core.stq_full(w)    := stq_full
     io.core.dis_stq_idx(w) := st_enq_idx
+    // 反馈给decode阶段，满了没有？ enq是enq到哪个位置了？
 
+    // 下面是decode阶段的入队
+    // 如果满了，应该会让io.core.dis_uops(w).valid为false
     val dis_ld_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_ldq && !io.core.dis_uops(w).bits.exception
     val dis_st_val = io.core.dis_uops(w).valid && io.core.dis_uops(w).bits.uses_stq && !io.core.dis_uops(w).bits.exception
     when (dis_ld_val)
     {
       ldq(ld_enq_idx).valid                := true.B
       ldq(ld_enq_idx).bits.uop             := io.core.dis_uops(w).bits
+      // 这个youngest_stq_idx写的厉害
       ldq(ld_enq_idx).bits.youngest_stq_idx  := st_enq_idx
+      // 注意next_live_store_mask是个变量，一开始是sq里面已经有的store的记录，每入队一个store都会在对应位置上写上
       ldq(ld_enq_idx).bits.st_dep_mask     := next_live_store_mask
 
       ldq(ld_enq_idx).bits.addr.valid      := false.B
@@ -340,6 +364,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     ld_enq_idx = Mux(dis_ld_val, WrapInc(ld_enq_idx, numLdqEntries),
                                  ld_enq_idx)
 
+    // 注意联系上面的那个ldq的st_dep_mask的设置
     next_live_store_mask = Mux(dis_st_val, next_live_store_mask | (1.U << st_enq_idx),
                                            next_live_store_mask)
     st_enq_idx = Mux(dis_st_val, WrapInc(st_enq_idx, numStqEntries),
@@ -348,9 +373,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     assert(!(dis_ld_val && dis_st_val), "A UOP is trying to go into both the LDQ and the STQ")
   }
 
+  // 做了个循环，最后的值赋给tail(Chisel还能这么写的啊？？)
   ldq_tail := ld_enq_idx
   stq_tail := st_enq_idx
 
+  // 定序的一些东西
   io.dmem.force_order   := io.core.fence_dmem
   io.core.fencei_rdy    := !stq_nonempty && io.dmem.ordered
 
@@ -363,9 +390,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // We can only report 1 exception per cycle.
   // Just be sure to report the youngest one
+  // 就是说接收到的这堆store和load，他们可能会有各种各样的异常，比如load发生page fault了，发生access fault了，发生missalign了
+  // 找到最老的发生异常的那一条，让ROB去等他到顶端然后直接全部干掉，就跟branch要找最老的发生误预测的是一样
   val mem_xcpt_valid  = Wire(Bool())
   val mem_xcpt_cause  = Wire(UInt())
+  // uop保证我们能找到ROB的位置
   val mem_xcpt_uop    = Wire(new MicroOp)
+  // vaddr是给page fault处理的**最重要的一个信息**
   val mem_xcpt_vaddr  = Wire(UInt())
 
 
@@ -375,8 +406,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // First we determine what operations are waiting to execute.
   // These are the "can_fire"/"will_fire" signals
 
-  // will指的是有请求
-  // can指的是会发生这个请求
+  // will指的是我们最终选择处理哪个请求
+  // can指的是我们可以处理这个请求
+  // 我们现在有memWidth这么多个ls流水线口
   val will_fire_load_incoming  = Wire(Vec(memWidth, Bool()))
   val will_fire_stad_incoming  = Wire(Vec(memWidth, Bool()))
   val will_fire_sta_incoming   = Wire(Vec(memWidth, Bool()))
@@ -390,9 +422,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val will_fire_store_commit   = Wire(Vec(memWidth, Bool()))
   val will_fire_load_wakeup    = Wire(Vec(memWidth, Bool()))
 
-  // 这个应该是发射队列送过来的ls访存流水线上的请求
+  // 这个是发射队列送过来的ls访存流水线上的请求
   val exe_req = WireInit(VecInit(io.core.exe.map(_.req)))
   // Sfence goes through all pipes
+  // 注意：如果发过来的是一个sfence，这种特殊指令一般后端只能有它一个人在跑，只要有任何一个口发过来的是它
+  // 强制让所有的口的请求都变成它(香山不把sfence发给ls流水线，而是发给Fence部件)
   for (i <- 0 until memWidth) {
     when (io.core.exe(i).req.bits.sfence.valid) {
       exe_req := VecInit(Seq.fill(memWidth) { io.core.exe(i).req })
@@ -404,6 +438,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Don't wakeup a load if we just sent it last cycle or two cycles ago
   // The block_load_mask may be wrong, but the executing_load mask must be accurate
+  // 就是说load刚刚发出去，第一个周期应该是去访问TLB，第二个周期去访问Dcache，这两周期不要再把它发出来
+  // 只要过了这两个周期，我们就能知道这个load到底是个什么情况了，它是TLB miss了吗？还是cache miss了？
+  // 有了这些信息我们可以决定我们要怎么处理这个load，它如果在这两周期被发出来了，就乱套了，因为有重复的load了
   val block_load_mask    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
   val p1_block_load_mask = RegNext(block_load_mask)
   val p2_block_load_mask = RegNext(p1_block_load_mask)
@@ -415,9 +452,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // The store at the commit head needs the DCache to appear ordered
   // Delay firing load wakeups and retries now
+  // 还是一个定序的操作，如果store需要Dcache定序，现在不要让load发出来，这点我现在还不是很清楚
   val store_needs_order = WireInit(false.B)
 
-  // loadstore流水线上送过来的请求在decode阶段是写到lq和sq的哪个位置
+  // loadstore流水线上送过来的请求在decode阶段是写到lq和sq的哪个位置？有uop我们就能知道这个指令在rob啊 lq啊 sq啊 这些东西的那些地方
   val ldq_incoming_idx = widthMap(i => exe_req(i).bits.uop.ldq_idx)
   // e为具体的index的数据
   val ldq_incoming_e   = widthMap(i => ldq(ldq_incoming_idx(i)))
@@ -426,6 +464,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_incoming_e   = widthMap(i => stq(stq_incoming_idx(i)))
 
   // agepriorityencoder可以选出从第二个参数开始的第一个参数第一个的那个index
+  // 我们说的retry指的是这个load它还没有得到物理地址，也就是说它可能TLB一直是miss的，所以要一直重发它，注意这里load如果已经发出去了，两个周期内不要再让他出来了
   val ldq_retry_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i => {
     val e = ldq(i).bits
     val block = block_load_mask(i) || p1_block_load_mask(i)
@@ -441,6 +480,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   val stq_commit_e  = stq(stq_execute_head)
 
+  // load已经有了物理地址也就是说它TLB命中了，但它还是没有成功，说明它应该是dcache miss或者它检查出了前面有相关的store，但是这个store它没有计算出数据
+  // 所以load没法得到它的结果，它sleep了，这个wakeup就是这个意思
   val ldq_wakeup_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i=> {
     val e = ldq(i).bits
     val block = block_load_mask(i) || p1_block_load_mask(i)
@@ -448,41 +489,52 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }), ldq_head))
   val ldq_wakeup_e   = ldq(ldq_wakeup_idx)
 
+
+  // ok 现在有的load和store它要去retry TLB 有的load它要去wakeup，然后去找数据(注意它不要再过TLB了，因为它已经有实地址了)
+  // 除了在lsq里面要retry或者是wakeup的这群东西，还有一群IQ发过来也要发射到访存流水线中的load和store
+  // 所以接下来我们要决定我们该如果往访存流水线里面发，以及发谁
+
   // -----------------------
   // Determine what can fire
 
   // Can we fire a incoming load
-  // 流水线来了load
+  // IQ来了load
   val can_fire_load_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_load)
 
   // Can we fire an incoming store addrgen + store datagen
-  // 流水线来了store，并且这个store是带address和data的？
+  // IQ来了store，并且这个store是带address和data的，所以IQ发完它就清空它自己的entry了
   val can_fire_stad_incoming = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
                                                               && exe_req(w).bits.uop.ctrl.is_std)
 
   // Can we fire an incoming store addrgen
-  // 流水线来了store，并且这个store是带address但不带data的？
+  // IQ来了store，并且这个store是带address但不带data的，这个也要去TLB地址转化，也要告诉ROB，store的地址好了
   val can_fire_sta_incoming  = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_sta
                                                               && !exe_req(w).bits.uop.ctrl.is_std)
 
   // Can we fire an incoming store datagen
-  // 流水线来了store，并且这个store是带data不带address的？
+  // IQ来了store，并且这个store是带data不带address的，这个就是用来给告诉ROB的，这个store的数据准备好了，等它的地址也好了，就可以commit了
   val can_fire_std_incoming  = widthMap(w => exe_req(w).valid && exe_req(w).bits.uop.ctrl.is_std
                                                               && !exe_req(w).bits.uop.ctrl.is_sta)
 
   // Can we fire an incoming sfence
-  // 流水线来的是sfence
+  // IQ来的是sfence
   val can_fire_sfence        = widthMap(w => exe_req(w).valid && exe_req(w).bits.sfence.valid)
+
+
+
+  // 下面是retry的wakeup和store的commit的特殊情况，他们与上面不同的是：上面的这些从IQ来的请求，可以走任意一条流水线出去，但是下面的这些
+  // 我们只让它走特定的流水线出去
 
   // Can we fire a request from dcache to release a line
   // This needs to go through LDQ search to mark loads as dangerous
   // dcache为什么要发release给LSU啊？，这里指最后一条通道是否收到的dcache的release请求
+  // 所以LSU有能力去"监听"当前这个核的cache是不是有release的动作，这是为了判断load-to-load用的
   val can_fire_release       = widthMap(w => (w == memWidth-1).B && io.dmem.release.valid)
   io.dmem.release.ready     := will_fire_release.reduce(_||_)
 
   // Can we retry a load that missed in the TLB
   // 这个被选为重发的load可以不可以重发
-  // 重发的load只在最后一个流水线里面发？
+  // retry的load只在最后一个流水线里面发
   val can_fire_load_retry    = widthMap(w =>
                                ( ldq_retry_e.valid                            &&
                                  ldq_retry_e.bits.addr.valid                  &&
@@ -496,6 +548,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Can we retry a store addrgen that missed in the TLB
   // - Weird edge case when sta_retry and std_incoming for same entry in same cycle. Delay this
+  // 这个被选为重发的store可以不可以重发
+  // retry的store也只在最后一个流水线里面发，并且如果有其他口来了当前这个retry的store的地址就不要让它发，这是出于什么考虑？
   val can_fire_sta_retry     = widthMap(w =>
                                ( stq_retry_e.valid                            &&
                                  stq_retry_e.bits.addr.valid                  &&
@@ -507,6 +561,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                                  stq_incoming_idx(i) === stq_retry_idx).reduce(_||_))
                                ))
   // Can we commit a store
+  // sq里面有一群等待commit到下级存储的store，他们全部走第一个流水线(也就是说这群store是ROB中已经commit了的，但是在sq还没有走的，他们要及时地写下去然后腾地方)
   val can_fire_store_commit  = widthMap(w =>
                                ( stq_commit_e.valid                           &&
                                 !stq_commit_e.bits.uop.is_fence               &&
@@ -520,6 +575,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Can we wakeup a load that was nack'd
   val block_load_wakeup = WireInit(false.B)
+  // 注意retry的和wakeup的load都是走最后一个流水线，他们有竞争
   val can_fire_load_wakeup = widthMap(w =>
                              ( ldq_wakeup_e.valid                                      &&
                                ldq_wakeup_e.bits.addr.valid                            &&
@@ -542,16 +598,26 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Can we fire a hellacache request that the dcache nack'd
   val can_fire_hella_wakeup    = WireInit(widthMap(w => false.B)) // This is assigned to in the hellashim controller
 
+  // 到目前为止，我们分析出来了所有的"有能力"向流水线发的所有的请求，包括IQ来的和LSQ中原本的retry之类的，
+  // 但是现在memWidth是有限的，我们现在要决定各个流水线发射那些请求，也就是说can_fire_*的不一定真正被发射出去
+  // 是被选为will_fire_*的才是真正将来要发射出去的请求
+  // 所以下面是讲如何进行选择
+
   //---------------------------------------------------------
   // Controller logic. Arbitrate which request actually fires
 
+  // 这个信号是用来告诉TLB，那些通道需要激活TLB去地址转化，这个设计不错
   val exe_tlb_valid = Wire(Vec(memWidth, Bool()))
   for (w <- 0 until memWidth) {
+    // 注意变量是var的
+    // 每一条流水线一开始都认为它的TLB ， Dcache，它的load cam ， ROB是可用的
     var tlb_avail  = true.B
     var dc_avail   = true.B
     var lcam_avail = true.B
     var rob_avail  = true.B
-
+    
+    // 不同的类型的请求会使用不同类型的资源，按照一个优先级(也就是下面从上到下，上面的优先级最高)，去竞争这个通道的资源，只要有
+    // 一个请求竞争到了一个资源，下面的要用这个资源的请求就不能发射，甚至如果这个通道两个请求所需要的资源不同，他们可以一起被发射出去(这个太6了)
     def lsu_sched(can_fire: Bool, uses_tlb:Boolean, uses_dc:Boolean, uses_lcam: Boolean, uses_rob:Boolean): Bool = {
       val will_fire = can_fire && !(uses_tlb.B && !tlb_avail) &&
                                   !(uses_lcam.B && !lcam_avail) &&
@@ -570,7 +636,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     //  - Incoming ops must get precedence, can't backpresure memaddrgen
     //  - Incoming hellacache ops must get precedence over retrying ops (PTW must get precedence over retrying translation)
     // Notes on performance
-    //  - Prioritize releases, this speeds up cache line writebacks and refills
+    //  - Prioritize releases, this speeds up cache line writebacks and refills **即release在最后一个通道有最高的优先级，它要标记load，来减少load-to-load的冒险**
     //  - Store commits are lowest priority, since they don't "block" younger instructions unless stq fills up
     will_fire_load_incoming (w) := lsu_sched(can_fire_load_incoming (w) , true , true , true , false) // TLB , DC , LCAM
     will_fire_stad_incoming (w) := lsu_sched(can_fire_stad_incoming (w) , true , false, true , true)  // TLB ,    , LCAM , ROB
@@ -588,6 +654,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
     assert(!(exe_req(w).valid && !(will_fire_load_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_incoming(w) || will_fire_std_incoming(w) || will_fire_sfence(w))))
 
+    // 如果是load的请求发出去了，让这个load先不要再去acquire请求了
     when (will_fire_load_wakeup(w)) {
       block_load_mask(ldq_wakeup_idx)           := true.B
     } .elsewhen (will_fire_load_incoming(w)) {
@@ -611,6 +678,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   //--------------------------------------------
   // TLB Access
+
+  // 注意，在选出will_fire的请求来之后的这同一个周期去给TLB发请求，在下一个周期得到TLB的响应结果
+  // 因为之前实例化过了一个DTLB在这个文件里面，所以直接用就行了，不接IO出去了
 
   assert(!(hella_state =/= h_ready && hella_req.cmd === rocket.M_SFENCE),
     "SFENCE through hella interface not supported")

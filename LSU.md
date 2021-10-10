@@ -22,7 +22,6 @@ Once a load address has been computed and placed in the LDQ, the corresponding *
 
 Loads are optimistically fired to memory on arrival to the **LSU** (getting loads fired early is a huge benefit of out–of–order pipelines). Simultaneously, **<u>the load instruction compares its address with all of the store addresses that it depends on. If there is a match, the memory request is killed(memory request是指发到访存子系统的请求)</u>**. **<u>If the corresponding store data is present, then the store data is *forwarded* to the load and the load marks itself as having *succeeded*.</u>** **<u>If the store data is not present, then the load goes to *sleep*. Loads that have been put to sleep are retried at a later time.</u>** [[1\]](https://docs.boom-core.org/en/latest/sections/load-store-unit.html?highlight=lsu#id3)
 
-
 发生了load-store违例的load是需要被kill掉的，不要让他去访存。
 如果load相关的store的数据在，直接给load，如果不在，load需要等一会再送出去。
 如果load去检查store的时候此时store的地址没有就绪怎么办？
@@ -31,11 +30,9 @@ Loads are optimistically fired to memory on arrival to the **LSU** (getting load
 但它们有信息在lq和sq里面，所以一旦发生TLB miss，可以在lq和sq里面去重发，应该就是下面这个retry的含义
 wakeup指的是load检查的时候发生了违例(或者前面还有store地址不就绪？)，但是store的数据还没就位，所以需要在lq里面sleep
 
-
 load queue的retry是地址valid，并且是虚地址，并且没有block
 store queue的retry是地址valid，并且是虚地址
 load queue的wake up是地址valid，并且实地址，没有block，没有execute没有成功
-
 
 这个IQ会发带地址和数据的store请求，只带地址的store请求，只带数据的store请求(为什么？)
 因为IQ中的store指令只要它的地址源操作数就绪了就可以发只带地址的store请求，防止在这个
@@ -48,11 +45,11 @@ store后面的load无法检查相关性，导致降低并发度，但是IQ将其
 + load store指令会进入到IQ中等待源操作数ready发射
 + load只有一个源寄存器，准备好了就可以发射，store的情况见上面的分析
 + load和store分别到对应的流水线去，经过地址计算单元得到虚地址，然后作为一个请求给lq和sq
-+ lq和sq就会分别监听对应的流水线
++ lq和sq就会分别监听对应的流水线(此时的lq和sq其实是有所有dispatch了的store和load的)
     + 如果有load发过来，就把它的虚拟地址写到lq中，设置为valid
     + 如果有store的地址过来，就把它的虚拟地址写到sq中，设置为valid
     + 如果有store的数据过来，就把它的数据写到sq中，设置为valid
-+ 因为从IQ中把东西发过来(地址，数据)，记录到了lq和sq中其实就ok了，它有没有去后面的访存流水级其实不重要，因为lq和sq中有它，可以从中发
++ 因为从IQ中把东西发过来(地址，数据)，记录到了lq和sq中其实就ok了，它有没有去后面的访存流水级其实不重要，因为lq和sq中有它，可以从中发，所以只要东西到位，IQ中的东西就可以滚蛋了
 
 
 ### load store的检查
@@ -62,12 +59,13 @@ thread1:                      thread2:
 load1  a                         
 ...                           store1  a
 load2  a
-load2提前于load1执行了，实际顺序应该是store1->load1->load2，预期是两个load都得到新的值，如果load2提前执行了，load1还没有执行，导致load2读到了旧值，但是load1读到新值，不满足程序序。这种情况有一个特点就是load2读完之后如果store写了，就会导致第一个核release掉这个block，把load2标志为observed，load1检查时去检查比他新的load，发现load2 observed并且地址相同，就发生了load-to-load违例，如果load1去检查的时候发现load2没有observed，就说明现在store还没有写，于是load1，load2都读到旧值，这种历史是可以的。
+load2提前于load1执行了，实际顺序应该是store1->load1->load2，预期是两个load都得到新的值，如果load2提前执行了，load1还没有执行，导致load2读到了旧值，但是load1读到新值，不可线性化(正则非原子)。这种情况有一个特点就是load2读完之后如果store写了，就会导致第一个核release掉这个block，那么此时我们**把load2标志为observed**，load1检查时去检查比他新的load，发现load2 observed并且地址相同，就发生了load-to-load违例，如果load1去检查的时候发现load2没有observed，就说明现在store还没有写，于是load1，load2都读到旧值，这种历史是可以的。
 
 如果load2出来之后发现有一个比他老的load1，并且load1已经有了物理地址，两个load的地址相同，那这个load1要么是还没有执行完，比如sleep了，要么是dcache miss了，数据还没上来。如果load2发现了这种情况，就不管有没有store，先把自己kill掉，不要让自己超过load1，把他发出去的访问cache的请求也kill掉.
 
-store需要检查是否有新的load插到他前面去了，并且这些load没有用这个store的数据，有两种情况：一个是这个load没有用forward的数据，一个是它用了，但是不是这个store的数据，是一个老的store的数据。
-lq中的order_fail把这个load标记为fail的load(最终怎么去处理这个fail？应该是作为一个异常去处理，因为这个load可能已经commit到ROB了，后面的一些指令已经使用了这个load的结果)。
+store需要检查是否有新的load插到他前面去了，并且这些load没有用这个store的数据，有两种情况：一个是这个load没有用forward的数据，这种情况下，这个load肯定用到的是一个错误的数据；一个是它用了，但是不是这个store的数据，是一个更老的store的数据。
+
+lq中的order_fail把这个load标记为fail的load(最终怎么去处理这个fail？应该是作为一个类似于异常的情况去处理，因为这个load可能已经commit到ROB了，后面的一些指令已经使用了这个load的结果，可能是等它到ROB的顶部后再恢复，也可能是检查到就直接恢复？)。
 
 load还需要搜索能否使用前面的store去forward，如果可以，且store的数据已经就绪了，就可以forward，不使用dcache的数据。如果store的数据没有就绪，就让这个load去sleep，过一段时间再发出来。如果这个load没有检测出来store相关，也可能是store还没有得到最终的物理地址。所以store的地址要尽早发出来，可以减少被kill掉的load，数据也要尽快搞到，不然load就要去sleep
 
