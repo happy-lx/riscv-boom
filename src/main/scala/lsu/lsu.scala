@@ -231,7 +231,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_head         = Reg(UInt(stqAddrSz.W)) // point to next store to clear from STQ (i.e., send to memory)
   //tail是用来接受输入的
   val stq_tail         = Reg(UInt(stqAddrSz.W))
-  // store在ROB中commit了之后就可以去execute了，execute应该指的是把它写入到下一级存储中
+  // store在ROB中commit了之后就可以去execute了，execute指针指向的store可以忘下一级存储写东西
+  // commit head指向还没有在rob中commit完的store，rob一旦commit就可以往前移动了
   val stq_commit_head  = Reg(UInt(stqAddrSz.W)) // point to next store to commit
   val stq_execute_head = Reg(UInt(stqAddrSz.W)) // point to next store to execute
 
@@ -530,6 +531,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // dcache为什么要发release给LSU啊？，这里指最后一条通道是否收到的dcache的release请求
   // 所以LSU有能力去"监听"当前这个核的cache是不是有release的动作，这是为了判断load-to-load用的
   val can_fire_release       = widthMap(w => (w == memWidth-1).B && io.dmem.release.valid)
+  // 这个意思是dcache要release还得等这个release真的被ls流水线发出去了才可以，性能可能会有所降低
   io.dmem.release.ready     := will_fire_release.reduce(_||_)
 
   // Can we retry a load that missed in the TLB
@@ -679,7 +681,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   //--------------------------------------------
   // TLB Access
 
-  // 注意，在选出will_fire的请求来之后的这同一个周期去给TLB发请求，在下一个周期得到TLB的响应结果
+  // 注意，在选出will_fire的请求来之后的这同一个周期去给TLB发请求，在这个周期得到TLB的响应结果
   // 因为之前实例化过了一个DTLB在这个文件里面，所以直接用就行了，不接IO出去了
 
   assert(!(hella_state =/= h_ready && hella_req.cmd === rocket.M_SFENCE),
@@ -748,6 +750,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   dtlb.io.sfence                    := exe_sfence
 
   // exceptions
+  // 这里暂时给一个我对这个异常的想法，因为missalign在发到ls流水线之前就可以检测到了，从IQ发往流水线的load store指令的优先级是最高的
+  // 所以在这个周期把这个异常和以前最新的异常去比较，每一个周期report一个最新的异常，在rob上把这条指令设置一下异常，之后就随便他们怎么跑了
+  // 反正最终都会flush掉，所以异常的指令之后应该还是有可能会去retry或者wakeup的（目前是这样想的）
   val ma_ld = widthMap(w => will_fire_load_incoming(w) && exe_req(w).bits.mxcpt.valid) // We get ma_ld in memaddrcalc
   val ma_st = widthMap(w => (will_fire_sta_incoming(w) || will_fire_stad_incoming(w)) && exe_req(w).bits.mxcpt.valid) // We get ma_ld in memaddrcalc
   val pf_ld = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).pf.ld && exe_tlb_uop(w).uses_ldq)
@@ -756,6 +761,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val ae_st = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).ae.st && exe_tlb_uop(w).uses_stq)
 
   // TODO check for xcpt_if and verify that never happens on non-speculative instructions.
+  // 异常的处理逻辑是在mem阶段
   val mem_xcpt_valids = RegNext(widthMap(w =>
                      (pf_ld(w) || pf_st(w) || ae_ld(w) || ae_st(w) || ma_ld(w) || ma_st(w)) &&
                      !io.core.exception &&
@@ -800,6 +806,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val exe_tlb_miss  = widthMap(w => dtlb.io.req(w).valid && (dtlb.io.resp(w).miss || !dtlb.io.req(w).ready))
   val exe_tlb_paddr = widthMap(w => Cat(dtlb.io.resp(w).paddr(paddrBits-1,corePgIdxBits),
                                         exe_tlb_vaddr(w)(corePgIdxBits-1,0)))
+  // 为什么都是让tlb去判断地址的空间范围呢
   val exe_tlb_uncacheable = widthMap(w => !(dtlb.io.resp(w).cacheable))
 
   for (w <- 0 until memWidth) {
@@ -811,6 +818,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         will_fire_load_retry(w) || will_fire_sta_retry(w)))
       // Technically only faulting AMOs need this
       assert(mem_xcpt_uops(w).uses_ldq ^ mem_xcpt_uops(w).uses_stq)
+      // 在mem这个周期把发生了异常的load和store在他们的queue中标记为发生异常
+      // 这个标记有什么用？发生异常的指令不是还是会继续去发请求吗？
       when (mem_xcpt_uops(w).uses_ldq)
       {
         ldq(mem_xcpt_uops(w).ldq_idx).bits.uop.exception := true.B
@@ -843,6 +852,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.dmem.req.bits  := dmem_req
   val dmem_req_fire = widthMap(w => dmem_req(w).valid && io.dmem.req.fire())
 
+  // s0应该是指exe阶段
   val s0_executing_loads = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B)))
 
 
@@ -924,6 +934,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
     //-------------------------------------------------------------
     // Write Addr into the LAQ/SAQ
+    // 因为现在还是在exe阶段，这一级有IQ发过来的请求和lsq retry和wakeup的请求，他们的地址等信息需要被更新
     when (will_fire_load_incoming(w) || will_fire_load_retry(w))
     {
       val ldq_idx = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), ldq_retry_idx)
@@ -941,7 +952,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       val stq_idx = Mux(will_fire_sta_incoming(w) || will_fire_stad_incoming(w),
         stq_incoming_idx(w), stq_retry_idx)
-
+      // store queue的addr的valid改成false，但是store queue的valid没有变
       stq(stq_idx).bits.addr.valid := !pf_st(w) // Prevent AMOs from executing!
       stq(stq_idx).bits.addr.bits  := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       stq(stq_idx).bits.uop.pdst   := exe_tlb_uop(w).pdst // Needed for AMOs
@@ -980,16 +991,20 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   //-------------------------------------------------------------
   // Note the DCache may not have accepted our request
 
+  // 有可能上一个周期的请求因为分支误预测kill掉了
   val exe_req_killed = widthMap(w => IsKilledByBranch(io.core.brupdate, exe_req(w).bits.uop))
   val stdf_killed = IsKilledByBranch(io.core.brupdate, io.core.fp_stdata.bits.uop)
 
+  //fired_*表示上一个周期是什么样的请求，并且它不能被kill掉
   val fired_load_incoming  = widthMap(w => RegNext(will_fire_load_incoming(w) && !exe_req_killed(w)))
   val fired_stad_incoming  = widthMap(w => RegNext(will_fire_stad_incoming(w) && !exe_req_killed(w)))
   val fired_sta_incoming   = widthMap(w => RegNext(will_fire_sta_incoming (w) && !exe_req_killed(w)))
   val fired_std_incoming   = widthMap(w => RegNext(will_fire_std_incoming (w) && !exe_req_killed(w)))
   val fired_stdf_incoming  = RegNext(will_fire_stdf_incoming && !stdf_killed)
+  // 这种请求不可能因为分支被kill掉
   val fired_sfence         = RegNext(will_fire_sfence)
   val fired_release        = RegNext(will_fire_release)
+
   val fired_load_retry     = widthMap(w => RegNext(will_fire_load_retry   (w) && !IsKilledByBranch(io.core.brupdate, ldq_retry_e.bits.uop)))
   val fired_sta_retry      = widthMap(w => RegNext(will_fire_sta_retry    (w) && !IsKilledByBranch(io.core.brupdate, stq_retry_e.bits.uop)))
   val fired_store_commit   = RegNext(will_fire_store_commit)
@@ -997,12 +1012,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val fired_hella_incoming = RegNext(will_fire_hella_incoming)
   val fired_hella_wakeup   = RegNext(will_fire_hella_wakeup)
 
+  // 这里把上一个周期的uop等一些信息拿到
+  // 可能是从IQ来的信息可能是lsq来的
+  // 注意：load 的 wakeup retry 和 store 的 retry一个周期只能选一个出来
   val mem_incoming_uop     = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, exe_req(w).bits.uop)))
   val mem_ldq_incoming_e   = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, ldq_incoming_e(w))))
   val mem_stq_incoming_e   = RegNext(widthMap(w => UpdateBrMask(io.core.brupdate, stq_incoming_e(w))))
   val mem_ldq_wakeup_e     = RegNext(UpdateBrMask(io.core.brupdate, ldq_wakeup_e))
   val mem_ldq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, ldq_retry_e))
   val mem_stq_retry_e      = RegNext(UpdateBrMask(io.core.brupdate, stq_retry_e))
+  // 根据来源区分每一个ls流水线的uop
   val mem_ldq_e            = widthMap(w =>
                              Mux(fired_load_incoming(w), mem_ldq_incoming_e(w),
                              Mux(fired_load_retry   (w), mem_ldq_retry_e,
@@ -1019,6 +1038,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val mem_paddr                = RegNext(widthMap(w => dmem_req(w).bits.addr))
 
   // Task 1: Clr ROB busy bit
+  // busy bit表示这个store的地址和数据还没有都准备好
+  // 这是处理的 store ， 在exe阶段虽然流水线可能选择了store，但是它有可能发生 tlb miss 或者发生异常
+  // 能否告知rob这个store数据以及地址准备好了还需要额外的判断
+  // rob的busy bit如果为false了说明这个store可以提交了
   val clr_bsy_valid   = RegInit(widthMap(w => false.B))
   val clr_bsy_rob_idx = Reg(Vec(memWidth, UInt(robAddrSz.W)))
   val clr_bsy_brmask  = Reg(Vec(memWidth, UInt(maxBrCount.W)))
@@ -1045,6 +1068,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
     } .elsewhen (fired_std_incoming(w)) {
+      // IQ发来的信号中怎么会带 地址是否是虚地址 的信息呢
       clr_bsy_valid   (w) := mem_stq_incoming_e(w).valid                 &&
                              mem_stq_incoming_e(w).bits.addr.valid       &&
                             !mem_stq_incoming_e(w).bits.addr_is_virtual  &&
@@ -1053,6 +1077,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       clr_bsy_rob_idx (w) := mem_stq_incoming_e(w).bits.uop.rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_stq_incoming_e(w).bits.uop)
     } .elsewhen (fired_sfence(w)) {
+      // sfence指令直接设置为可以提交了，只在第一个流水线设置，反正所有的流水线都是它
       clr_bsy_valid   (w) := (w == 0).B // SFence proceeds down all paths, only allow one to clr the rob
       clr_bsy_rob_idx (w) := mem_incoming_uop(w).rob_idx
       clr_bsy_brmask  (w) := GetNewBrMask(io.core.brupdate, mem_incoming_uop(w))
@@ -1072,6 +1097,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     io.core.clr_bsy(w).bits  := clr_bsy_rob_idx(w)
   }
 
+  // 如果store的浮点操作数也就位了
   val stdf_clr_bsy_valid   = RegInit(false.B)
   val stdf_clr_bsy_rob_idx = Reg(UInt(robAddrSz.W))
   val stdf_clr_bsy_brmask  = Reg(UInt(maxBrCount.W))
@@ -1090,7 +1116,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
 
 
-
+  // 单独为它设计一个口，让它通知rob
   io.core.clr_bsy(memWidth).valid := stdf_clr_bsy_valid &&
                                     !IsKilledByBranch(io.core.brupdate, stdf_clr_bsy_brmask) &&
                                     !io.core.exception && !RegNext(io.core.exception) && !RegNext(RegNext(io.core.exception))
@@ -1142,12 +1168,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // Mask of stores which we can forward from
   val ldst_forward_matches = WireInit(widthMap(w => VecInit((0 until numStqEntries).map(x=>false.B))))
 
+  // failed load用来报告异常，和之前的exe阶段得到的异常进行综合，报告一个最老的异常
   val failed_loads     = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which we will report as failures (throws a mini-exception)
   val nacking_loads    = WireInit(VecInit((0 until numLdqEntries).map(x=>false.B))) // Loads which are being nacked by dcache in the next stage
 
   val s1_executing_loads = RegNext(s0_executing_loads)
   val s1_set_execute     = WireInit(s1_executing_loads)
 
+  // 大概是mem阶段搜索load可以从哪个store那得到数据
+  // 把这个regnext到wb阶段，真正的数据选择是在wb阶段
   val mem_forward_valid   = Wire(Vec(memWidth, Bool()))
   val mem_forward_ldq_idx = lcam_ldq_idx
   val mem_forward_ld_addr = lcam_addr
@@ -1158,19 +1187,24 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val wb_forward_ld_addr  = RegNext(mem_forward_ld_addr)
   val wb_forward_stq_idx  = RegNext(mem_forward_stq_idx)
 
+  // 遍历一下所有的load queue的entry，去和mem阶段的load和store请求做检查
   for (i <- 0 until numLdqEntries) {
     val l_valid = ldq(i).valid
     val l_bits  = ldq(i).bits
     val l_addr  = ldq(i).bits.addr.bits
     val l_mask  = GenByteMask(l_addr, l_bits.uop.mem_size)
 
+    // 表示当前的这个load entry正在wb阶段forwarding，
+    // 可以拿到这个entry在wb阶段在forward哪个store的信息
+    // 这个是为了方便store去检查有没有违例，如果这个load forward的不是正确的store就违例了
     val l_forwarders      = widthMap(w => wb_forward_valid(w) && wb_forward_ldq_idx(w) === i.U)
     val l_is_forwarding   = l_forwarders.reduce(_||_)
     val l_forward_stq_idx = Mux(l_is_forwarding, Mux1H(l_forwarders, wb_forward_stq_idx), l_bits.forward_stq_idx)
 
-
+    // 比如一个block 512个byte，先看看是不是block match，match的话再看看 一个double word是不是match
     val block_addr_matches = widthMap(w => lcam_addr(w) >> blockOffBits === l_addr >> blockOffBits)
     val dword_addr_matches = widthMap(w => block_addr_matches(w) && lcam_addr(w)(blockOffBits-1,3) === l_addr(blockOffBits-1,3))
+    // double word里面的mask，一位表示一个byte
     val mask_match   = widthMap(w => (l_mask & lcam_mask(w)) === l_mask)
     val mask_overlap = widthMap(w => (l_mask & lcam_mask(w)).orR)
 
@@ -1184,6 +1218,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         // This load has been observed, so if a younger load to the same address has not
         // executed yet, this load must be squashed
         ldq(i).bits.observed := true.B
+        // store-load 违例检查
+        // store的话就需要去检查哪些load已经执行完了，或者load正在forward
+        // 但是他们没有forward或者forward了错误的store
       } .elsewhen (do_st_search(w)                                                                                                &&
                    l_valid                                                                                                        &&
                    l_bits.addr.valid                                                                                              &&
@@ -1200,6 +1237,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           ldq(i).bits.order_fail := true.B
           failed_loads(i)        := true.B
         }
+        // load - load的违例检查
       } .elsewhen (do_ld_search(w)            &&
                    l_valid                    &&
                    l_bits.addr.valid          &&
@@ -1217,6 +1255,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         } .elsewhen (lcam_ldq_idx(w) =/= i.U) {
           // The load is older, and either it hasn't executed, it was nacked, or it is ignoring its response
           // we need to kill ourselves, and prevent forwarding
+          // 如果searcher比这个load entry年轻，但是这个load被阻塞了，因为cache miss，那searcher也没必要访问cache了，也不要去forward了
+          // nack的load是怎么处理的？？
           val older_nacked = nacking_loads(i) || RegNext(nacking_loads(i))
           when (!(l_bits.executed || l_bits.succeeded) || older_nacked) {
             s1_set_execute(lcam_ldq_idx(w))    := false.B
@@ -1239,6 +1279,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val write_mask = GenByteMask(s_addr, s_uop.mem_size)
     for (w <- 0 until memWidth) {
       when (do_ld_search(w) && stq(i).valid && lcam_st_dep_mask(w)(i)) {
+        //完全重叠的情况
         when (((lcam_mask(w) & write_mask) === lcam_mask(w)) && !s_uop.is_fence && dword_addr_matches(w) && can_forward(w))
         {
           ldst_addr_matches(w)(i)            := true.B
@@ -1246,12 +1287,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
           s1_set_execute(lcam_ldq_idx(w))    := false.B
         }
+        //有交叠的情况
           .elsewhen (((lcam_mask(w) & write_mask) =/= 0.U) && dword_addr_matches(w))
         {
           ldst_addr_matches(w)(i)            := true.B
           io.dmem.s1_kill(w)                 := RegNext(dmem_req_fire(w))
           s1_set_execute(lcam_ldq_idx(w))    := false.B
         }
+        //这是什么情况
           .elsewhen (s_uop.is_fence || s_uop.is_amo)
         {
           ldst_addr_matches(w)(i)            := true.B
@@ -1264,11 +1307,13 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Set execute bit in LDQ
   // executed这个信号是用来干什么的
+  // mem阶段有些load 不访存了（不添麻烦或者可以forward），如果确实让dcache访存了，就把execute写为true
   for (i <- 0 until numLdqEntries) {
     when (s1_set_execute(i)) { ldq(i).bits.executed := true.B }
   }
 
   // Find the youngest store which the load is dependent on
+  // load翻了一遍sq，找到了和它相关的store，但是需要forward最近的那个
   val forwarding_age_logic = Seq.fill(memWidth) { Module(new ForwardingAgeLogic(numStqEntries)) }
   for (w <- 0 until memWidth) {
     forwarding_age_logic(w).io.addr_matches    := ldst_addr_matches(w).asUInt
@@ -1306,7 +1351,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
-
+  // 这个不知道是什么意思，但是valid 总是false，就不用管了
   // Task 3: Clr unsafe bit in ROB for succesful translations
   //         Delay this a cycle to avoid going ahead of the exception broadcast
   //         The unsafe bit is cleared on the first translation, so no need to fire for load wakeups
@@ -1348,7 +1393,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.lxcpt.bits  := r_xcpt
 
   // Task 4: Speculatively wakeup loads 1 cycle before they come back
-  // load被发到了流水线，TLB不一定命中，cache也不一定命中，推测唤醒一下IQ里面的相关性指令
+  // load被发到了流水线的mem阶段，TLB不一定命中，cache也不一定命中，推测唤醒一下IQ里面的相关性指令
+  // 如果load成功执行，下一个周期就可以得到数据，正好可以forward到推测唤醒的IQ指令。如果load没有执行成功，推测唤醒的指令要kill掉，基于IQ重发
   for (w <- 0 until memWidth) {
     io.core.spec_ld_wakeup(w).valid := enableFastLoadUse.B          &&
                                        fired_load_incoming(w)       &&
@@ -1366,6 +1412,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
   // Handle Memory Responses and nacks
   //----------------------------------
+  // nack掉的load怎么办，好像是sleep了，后面重发，过一会cache拿到数据就可以了
   for (w <- 0 until memWidth) {
     io.core.exe(w).iresp.valid := false.B
     io.core.exe(w).fresp.valid := false.B
@@ -1390,7 +1437,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
         .otherwise
       {
+        // store的nack
         assert(io.dmem.nack(w).bits.uop.uses_stq)
+        // store是顺序commit的
+        // 每次在exe阶段commit一个store不管最终有没有成功，都把execute_head加1，然后下一个周期commit下一个
+        // 当mem阶段检测到store没有成功，被nack了，就把execute_head挪回来，下次继续发commit请求，等dcache拿到数据后就可以成功了
         when (IsOlder(io.dmem.nack(w).bits.uop.stq_idx, stq_execute_head, stq_head)) {
           stq_execute_head := io.dmem.nack(w).bits.uop.stq_idx
         }
@@ -1399,6 +1450,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     // Handle the response
     when (io.dmem.resp(w).valid)
     {
+      // 把response发出去，声明是那条指令（load store） ，得到了什么样的执行结果，比如load拿到了什么数据
+      // 这样rob可以吧load设置为已完成，也可已去唤醒IQ里面的指令
+      // 也把lq sq里面已完成的设置为success，success的store可以清除掉，success的load需要等commit才能清除掉
       when (io.dmem.resp(w).bits.uop.uses_ldq)
       {
         assert(!io.dmem.resp(w).bits.is_hella)
@@ -1434,6 +1488,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
     }
 
+    //forward逻辑，利用了chisel的后面的代码覆盖前面代码的方法
 
     when (dmem_resp_fired(w) && wb_forward_valid(w))
     {
@@ -1587,6 +1642,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   ldq_head        := temp_ldq_head
 
   // store has been committed AND successfully sent data to memory
+  // 这条store的生命周期在sq中就结束了，head向前移动一位释放slot，并且clear掉它后面所有load的store mask
+  // 注意：是利用stq_head顺序清空store，有可能stq_head的store nack了，但它后面的store成功写到dcache了，后面的store不清空，
+  // 所以load还是可以从这些store entry forward数据
   when (stq(stq_head).valid && stq(stq_head).bits.committed)
   {
     when (stq(stq_head).bits.uop.is_fence && !io.dmem.ordered) {
@@ -1712,7 +1770,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       .otherwise // exception
     {
       stq_tail := stq_commit_head
-
+      //注意 ： 已经commit了但是还没写到dcache的store是不能被kill掉的
       for (i <- 0 until numStqEntries)
       {
         when (!stq(i).bits.committed && !stq(i).bits.succeeded)
@@ -1724,7 +1782,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         }
       }
     }
-
+    // load queue在异常的时候全部kill掉就可以了
     for (i <- 0 until numLdqEntries)
     {
       ldq(i).valid           := false.B
