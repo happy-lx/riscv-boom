@@ -603,7 +603,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // 到目前为止，我们分析出来了所有的"有能力"向流水线发的所有的请求，包括IQ来的和LSQ中原本的retry之类的，
   // 但是现在memWidth是有限的，我们现在要决定各个流水线发射那些请求，也就是说can_fire_*的不一定真正被发射出去
   // 是被选为will_fire_*的才是真正将来要发射出去的请求
-  // 所以下面是讲如何进行选择
+  // 所以下面是如何进行选择
 
   //---------------------------------------------------------
   // Controller logic. Arbitrate which request actually fires
